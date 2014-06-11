@@ -1,0 +1,470 @@
+diff --git a/src/main/java/org/kiji/scoring/MapFamilyScoringProducer.java b/src/main/java/org/kiji/scoring/MapFamilyScoringProducer.java
+new file mode 100644
+index 0000000..83c6449
+--- /dev/null
++++ b/src/main/java/org/kiji/scoring/MapFamilyScoringProducer.java
+@@ -0,0 +1,227 @@
++/**
++ * (c) Copyright 2014 WibiData, Inc.
++ *
++ * See the NOTICE file distributed with this work for additional
++ * information regarding copyright ownership.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.kiji.scoring;
++
++import java.io.IOException;
++import java.util.Collections;
++import java.util.Map;
++import java.util.Set;
++
++import com.google.common.base.Preconditions;
++import com.google.gson.Gson;
++import org.apache.hadoop.conf.Configuration;
++
++import org.kiji.mapreduce.KijiContext;
++import org.kiji.mapreduce.kvstore.KeyValueStore;
++import org.kiji.mapreduce.kvstore.KeyValueStoreReaderFactory;
++import org.kiji.mapreduce.produce.KijiProducer;
++import org.kiji.mapreduce.produce.ProducerContext;
++import org.kiji.schema.KijiColumnName;
++import org.kiji.schema.KijiDataRequest;
++import org.kiji.schema.KijiIOException;
++import org.kiji.schema.KijiRowData;
++import org.kiji.scoring.ScoreFunction.TimestampedValue;
++import org.kiji.scoring.impl.InternalFreshenerContext;
++import org.kiji.scoring.impl.ScoringUtils;
++
++/**
++ * KijiProducer implementation which runs a ScoreFunction for qualifiers in a map-type family.
++ *
++ * <p>
++ *   To use, Extend this class and implement
++ *   {@link #getQualifiersToScore(org.kiji.schema.KijiRowData, FreshenerContext)} then run a Kiji
++ *   produce job with your implementation. An example implementation and usage can be found in
++ *   TestMapFamilyScoringProducer.
++ * </p>
++ *
++ * <p>
++ *   This producer uses two required Configuration keys, and one optional key.
++ *   <ul>
++ *     <li>
++ *       {@link #SCORE_FUNCTION_CLASS_KEY} must contain the fully qualified class name of the
++ *       ScoreFunction class to run in this producer.
++ *     </li>
++ *     <li>
++ *       {@link #ATTACHED_FAMILY_KEY} must contain the name of the family on whose qualifiers to run
++ *       the ScoreFunction.
++ *     </li>
++ *     <li>
++ *       {@link #PARAMETERS_KEY} may contain a json serialized string of freshening parameters which
++ *       will be used to configure the ScoreFunction.
++ *     </li>
++ *   </ul>
++ * </p>
++ *
++ * <p>
++ *   When using MapFamilyScoringProducer to perform batch scoring, several things must be kept in
++ *   mind.
++ *   <ul>
++ *     <li>
++ *       The lifecycle of KijiProducer is slightly different from ScoreFunction. Some methods will
++ *       be called in different orders. Specifically,
++ *       {@link ScoreFunction#getDataRequest(FreshenerContext)} will be called before
++ *       {@link ScoreFunction#setup(FreshenerSetupContext)} and will be called in the context of the
++ *       entire map family, rather than a specific qualified column. getDataRequest will be called
++ *       once for the entire job and the resulting KijiRowData will be passed to all calls to
++ *       {@link ScoreFunction#score(org.kiji.schema.KijiRowData, FreshenerContext)}.
++ *     </li>
++ *     <li>
++ *       Rather than allowing the Kiji MR framework to manage KeyValueStores for this producer, this
++ *       producer will manage KeyValueStores for the ScoreFunction it runs. This means that
++ *       unconfigured KeyValueStores will not be properly overridden by KeyValueStore configuration
++ *       provided on the command line via the kiji produce CLI or via
++ *       {@link org.kiji.mapreduce.framework.MapReduceJobBuilder#withStore(String,
++ *       org.kiji.mapreduce.kvstore.KeyValueStore)}.
++ *     </li>
++ *     <li>
++ *       While this producer is designed to run a ScoreFunction against columns which may not have
++ *       any data in them (the column thus does not exist yet). The Kiji MR framework requires that
++ *       at least one requested column contains data or the row will be skipped entirely.
++ *     </li>
++ *   </ul>
++ * </p>
++ */
++public abstract class MapFamilyScoringProducer extends KijiProducer {
++
++  /** Fully qualified name of the ScoreFunction class to run. */
++  public static final String SCORE_FUNCTION_CLASS_KEY =
++      "org.kiji.scoring.MapFamilyScoringProducer.score_function_class_key";
++  /** Family in which to refresh values. */
++  public static final String ATTACHED_FAMILY_KEY =
++      "org.kiji.scoring.MapFamilyScoringProducer.attached_column_key";
++  /** Configuration parameters for the ScoreFunction. */
++  public static final String PARAMETERS_KEY =
++      "org.kiji.scoring.MapFamilyScoringProducer.parameters_key";
++  /** Gson used to deserialize parameters from json. */
++  private static final Gson GSON = new Gson();
++
++  /** Empty constructor to be used via reflection. */
++  public MapFamilyScoringProducer() { }
++
++  /** ScoreFunction to run on each qualifier in the family. */
++  private ScoreFunction<?> mScoreFunction = null;
++  /**
++   * Context for the entire family.
++   * <p>
++   *   Used for getRequiredStores, setup, cleanup, getDataRequest. For score, a new context will be
++   *   created for each qualifier.
++   * </p>
++   */
++  private InternalFreshenerContext mFreshenerContext = null;
++  /**
++   * KeyValueStoreReaderFactory used to create contexts for each qualifier.
++   */
++  private KeyValueStoreReaderFactory mKvStoreReaderFactory = null;
++
++  /** {@inheritDoc} */
++  @SuppressWarnings("unchecked")
++  @Override
++  public void setConf(
++      final Configuration conf
++  ) {
++    super.setConf(conf);
++    final String sfClassName = Preconditions.checkNotNull(
++        conf.get(SCORE_FUNCTION_CLASS_KEY),
++        "Configuration must include a fully qualified ScoreFunction class name at key: %s",
++        SCORE_FUNCTION_CLASS_KEY);
++
++    final String family = Preconditions.checkNotNull(
++        conf.get(ATTACHED_FAMILY_KEY),
++        "Configuration must include a family name at key: %s",
++        ATTACHED_FAMILY_KEY);
++    final KijiColumnName column = new KijiColumnName(family, null);
++
++    final String serializedParameters = conf.get(PARAMETERS_KEY);
++    final Map<String, String> parameters = (null != serializedParameters)
++        ? GSON.fromJson(serializedParameters, Map.class)
++        : Collections.emptyMap();
++
++    mScoreFunction = ScoringUtils.scoreFunctionForName(sfClassName);
++    mFreshenerContext = InternalFreshenerContext.create(column, parameters);
++    mKvStoreReaderFactory =
++        KeyValueStoreReaderFactory.create(mScoreFunction.getRequiredStores(mFreshenerContext));
++    mFreshenerContext.setKeyValueStoreReaderFactory(mKvStoreReaderFactory);
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public Map<String, KeyValueStore<?, ?>> getRequiredStores() {
++    // Instead of having the MR framework manage the KeyValueStores for the producer, the producer
++    // will manage the stores for the ScoreFunction.
++    return Collections.emptyMap();
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public void setup(KijiContext context) throws IOException {
++    mScoreFunction.setup(mFreshenerContext);
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public void cleanup(KijiContext context) throws IOException {
++    mScoreFunction.cleanup(mFreshenerContext);
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public KijiDataRequest getDataRequest() {
++    try {
++      return mScoreFunction.getDataRequest(mFreshenerContext);
++    } catch (IOException ioe) {
++      throw new KijiIOException(ioe);
++    }
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public String getOutputColumn() {
++    return mFreshenerContext.getAttachedColumn().getName();
++  }
++
++  /** {@inheritDoc} */
++  @Override
++  public void produce(
++      final KijiRowData input,
++      final ProducerContext context
++  ) throws IOException {
++    for (String qualifier : getQualifiersToScore(input, mFreshenerContext)) {
++      final FreshenerContext qualifierContext = InternalFreshenerContext.create(
++          mFreshenerContext.getClientRequest(),
++          new KijiColumnName(mFreshenerContext.getAttachedColumn().getFamily(), qualifier),
++          mFreshenerContext.getParameters(),
++          Collections.<String, String>emptyMap(),
++          mKvStoreReaderFactory);
++      final TimestampedValue<?> score = mScoreFunction.score(input, qualifierContext);
++      context.put(qualifier, score.getTimestamp(), score.getValue());
++    }
++  }
++
++  /**
++   * Get the set of qualifiers to score.
++   *
++   * @param input KijiRowData corresponding to the ScoreFunction's
++   *     {@link ScoreFunction#getDataRequest(FreshenerContext)} method.
++   * @param context FreshenerContext for the entire map family.
++   * @return the set of qualifiers to score.
++   * @throws IOException in case of an error getting the qualifiers.
++   */
++  public abstract Set<String> getQualifiersToScore(KijiRowData input, FreshenerContext context)
++      throws IOException;
++}
+diff --git a/src/main/java/org/kiji/scoring/impl/InternalFreshKijiTableReader.java b/src/main/java/org/kiji/scoring/impl/InternalFreshKijiTableReader.java
+index 36e0f6f..38526a5 100644
+--- a/src/main/java/org/kiji/scoring/impl/InternalFreshKijiTableReader.java
++++ b/src/main/java/org/kiji/scoring/impl/InternalFreshKijiTableReader.java
+@@ -16,7 +16,6 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+ package org.kiji.scoring.impl;
+ 
+ import java.io.IOException;
+diff --git a/src/test/java/org/kiji/scoring/TestMapFamilyScoringProducer.java b/src/test/java/org/kiji/scoring/TestMapFamilyScoringProducer.java
+new file mode 100644
+index 0000000..a0d9df2
+--- /dev/null
++++ b/src/test/java/org/kiji/scoring/TestMapFamilyScoringProducer.java
+@@ -0,0 +1,139 @@
++/**
++ * (c) Copyright 2014 WibiData, Inc.
++ *
++ * See the NOTICE file distributed with this work for additional
++ * information regarding copyright ownership.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.kiji.scoring;
++
++import java.io.IOException;
++import java.util.Set;
++
++import com.google.common.collect.Sets;
++import org.apache.hadoop.conf.Configuration;
++import org.junit.After;
++import org.junit.Assert;
++import org.junit.Before;
++import org.junit.Test;
++
++import org.kiji.mapreduce.KijiMapReduceJob;
++import org.kiji.mapreduce.output.MapReduceJobOutputs;
++import org.kiji.mapreduce.produce.KijiProduceJobBuilder;
++import org.kiji.schema.EntityId;
++import org.kiji.schema.KijiClientTest;
++import org.kiji.schema.KijiDataRequest;
++import org.kiji.schema.KijiRowData;
++import org.kiji.schema.KijiTable;
++import org.kiji.schema.KijiTableReader;
++import org.kiji.schema.layout.KijiTableLayouts;
++import org.kiji.schema.util.InstanceBuilder;
++
++public class TestMapFamilyScoringProducer extends KijiClientTest {
++  private static final String LAYOUT_PATH = "test-map-family-freshening.json";
++  private static final String TABLE_NAME = "test_map_family_freshening";
++
++  private static final String ENTITY = "foo";
++  private static final String MAP = "map";
++  private static final String QUAL0 = "qual0";
++  private static final String QUAL1 = "qual1";
++  private static final String INFO = "info";
++  private static final String NAME = "name";
++  private static final String FOO_VAL = "foo-val";
++  private static final String NEW_VAL = "new-val";
++
++  private static final class TestMapFamilyScoreFunction extends ScoreFunction<String> {
++    public KijiDataRequest getDataRequest(
++        final FreshenerContext context
++    ) throws IOException {
++      // getDataRequest should only be called in the context of the entire family.
++      Assert.assertTrue(!context.getAttachedColumn().isFullyQualified());
++      // Note: the ScoreFunction must request some data that exists in every row, even if it does
++      // not use the data, otherwise the row will be skipped.
++      return KijiDataRequest.create(INFO, NAME);
++    }
++
++    public TimestampedValue<String> score(
++        final KijiRowData dataToScore,
++        final FreshenerContext context
++    ) throws IOException {
++      // score should only be called in the context of a qualified column.
++      Assert.assertTrue(context.getAttachedColumn().isFullyQualified());
++      return TimestampedValue.create(NEW_VAL);
++    }
++  }
++
++  private static final class TestMapFamilyScoringProducerImpl extends MapFamilyScoringProducer {
++    public Set<String> getQualifiersToScore(
++        final KijiRowData input,
++        final FreshenerContext context
++    ) throws IOException {
++      // getQualifiersToScore should only be called in the context of the entire family.
++      Assert.assertTrue(!context.getAttachedColumn().isFullyQualified());
++      // This uses the info:name column because the layout already contains it, normally this would
++      // be a column specific for this information.
++      final String qualifiers = input.getMostRecentValue(INFO, NAME).toString();
++      return Sets.newHashSet(qualifiers.split(","));
++    }
++  }
++
++  private KijiTable mTable = null;
++  private KijiTableReader mReader = null;
++  private EntityId mEid = null;
++
++  @Before
++  public void setupTestMapFamilyProducer() throws IOException {
++    new InstanceBuilder(getKiji())
++        .withTable(KijiTableLayouts.getLayout(LAYOUT_PATH))
++            .withRow(ENTITY)
++                .withFamily(MAP)
++                    .withQualifier(QUAL0)
++                        .withValue(10, FOO_VAL)
++                    .withQualifier(QUAL1)
++                        .withValue(10, FOO_VAL)
++                .withFamily(INFO)
++                    .withQualifier(NAME)
++                        .withValue(QUAL0 + "," + QUAL1)
++        .build();
++    mTable = getKiji().openTable(TABLE_NAME);
++    mReader = mTable.openTableReader();
++    mEid = mTable.getEntityId(ENTITY);
++  }
++
++  @After
++  public void cleanupTestMapFamilyProducer() throws IOException {
++    mReader.close();
++    mTable.release();
++  }
++
++  @Test
++  public void test() throws IOException, InterruptedException, ClassNotFoundException {
++    final Configuration conf = getConf();
++    conf.set(MapFamilyScoringProducer.ATTACHED_FAMILY_KEY, MAP);
++    // These empty parameters could be omitted.
++    conf.set(MapFamilyScoringProducer.PARAMETERS_KEY, "{}");
++    conf.set(MapFamilyScoringProducer.SCORE_FUNCTION_CLASS_KEY,
++        TestMapFamilyScoreFunction.class.getName());
++    final KijiMapReduceJob job = KijiProduceJobBuilder.create()
++        .withConf(conf)
++        .withProducer(TestMapFamilyScoringProducerImpl.class)
++        .withInputTable(mTable.getURI())
++        .withOutput(MapReduceJobOutputs.newDirectKijiTableMapReduceJobOutput(mTable.getURI()))
++        .build();
++    Assert.assertTrue(job.run());
++    final KijiRowData data = mReader.get(mEid, KijiDataRequest.create(MAP));
++    Assert.assertEquals(NEW_VAL, data.getMostRecentValue(MAP, QUAL0).toString());
++    Assert.assertEquals(NEW_VAL, data.getMostRecentValue(MAP, QUAL1).toString());
++  }
++}
+diff --git a/src/test/java/org/kiji/scoring/impl/TestInternalFreshKijiTableReader.java b/src/test/java/org/kiji/scoring/impl/TestInternalFreshKijiTableReader.java
+index 76f79dc..8a39c06 100644
+--- a/src/test/java/org/kiji/scoring/impl/TestInternalFreshKijiTableReader.java
++++ b/src/test/java/org/kiji/scoring/impl/TestInternalFreshKijiTableReader.java
+@@ -1613,4 +1613,53 @@ public void testIsolatedGetTimeout() throws IOException {
+       freshReader.close();
+     }
+   }
++
++  public static final class TestMapFamilyScoreFunction extends ScoreFunction<Integer> {
++    public KijiDataRequest getDataRequest(final FreshenerContext context) throws IOException {
++      return KijiDataRequest.empty();
++    }
++    public TimestampedValue<Integer> score(
++        final KijiRowData dataToScore, final FreshenerContext context
++    ) throws IOException {
++      return TimestampedValue.create(10);
++    }
++  }
++
++  @Test
++  public void testMapFamily() throws IOException {
++    final EntityId eid = mTable.getEntityId("foo");
++    final KijiDataRequest request = KijiDataRequest.builder().addColumns(
++        ColumnsDef.create().add("map", "qualifier").add("map", "qualifier1")
++    ).build();
++
++    final KijiFreshnessManager manager = KijiFreshnessManager.create(mKiji);
++    try {
++      manager.registerFreshener(
++          TABLE_NAME,
++          new KijiColumnName("map"),
++          ALWAYS,
++          new TestMapFamilyScoreFunction(),
++          EMPTY_PARAMS,
++          false,
++          false);
++    } finally {
++      manager.close();
++    }
++    final InternalFreshKijiTableReader freshReader =
++        (InternalFreshKijiTableReader) FreshKijiTableReader.Builder.create()
++            .withTable(mTable)
++            .withTimeout(500)
++            .withPartialFreshening(true)
++            .build();
++    try {
++      final Integer expected = 10;
++      final KijiRowData data = freshReader.get(eid, request);
++      final Integer actual = data.getMostRecentValue("map", "qualifier");
++      final Integer actual1 = data.getMostRecentValue("map", "qualifier1");
++      assertEquals(expected, actual);
++      assertEquals(expected, actual1);
++    } finally {
++      freshReader.close();
++    }
++  }
+ }
+diff --git a/src/test/java/org/kiji/scoring/impl/TestMapFamilyFreshening.java b/src/test/java/org/kiji/scoring/impl/TestMapFamilyFreshening.java
+index 0e01b31..e780683 100644
+--- a/src/test/java/org/kiji/scoring/impl/TestMapFamilyFreshening.java
++++ b/src/test/java/org/kiji/scoring/impl/TestMapFamilyFreshening.java
+@@ -75,7 +75,7 @@ public KijiDataRequest getDataRequest(
+         final KijiRowData dataToScore,
+         final FreshenerContext context
+     ) throws IOException {
+-      return TimestampedValue.create("new-val");
++      return TimestampedValue.create(NEW_VAL);
+     }
+   }
+ 
+@@ -89,7 +89,7 @@ public KijiDataRequest getDataRequest(
+         final KijiRowData dataToScore,
+         final FreshenerContext context
+     ) throws IOException {
+-      return TimestampedValue.create("new-name");
++      return TimestampedValue.create(NEW_NAME);
+     }
+   }
+ 
